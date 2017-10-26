@@ -1,3 +1,4 @@
+
 """Binary classes"""
 from __future__ import print_function
 
@@ -19,6 +20,7 @@ from bx.seq.twobit import TWOBIT_MAGIC_NUMBER, TWOBIT_MAGIC_NUMBER_SWAP, TWOBIT_
 from galaxy.datatypes import metadata
 from galaxy.datatypes.metadata import DictParameter, ListParameter, MetadataElement, MetadataParameter
 from galaxy.util import FILENAME_VALID_CHARS, nice_size, sqlite, which
+from galaxy.util.checkers import is_bz2, is_gzip
 from . import data, dataproviders
 
 
@@ -287,8 +289,10 @@ class Bam( Binary ):
 
     def _is_coordinate_sorted( self, file_name ):
         """See if the input BAM file is sorted from the header information."""
-        output = subprocess.check_output(["samtools", "view", "-H", file_name])
-        return 'SO:coordinate' in output or 'SO:sorted' in output
+        params = [ "samtools", "view", "-H", file_name ]
+        output = subprocess.Popen( params, stderr=subprocess.PIPE, stdout=subprocess.PIPE ).communicate()[0]
+        # find returns -1 if string is not found
+        return output.find( "SO:coordinate" ) != -1 or output.find( "SO:sorted" ) != -1
 
     def dataset_content_needs_grooming( self, file_name ):
         """See if file_name is a sorted BAM file"""
@@ -313,7 +317,8 @@ class Bam( Binary ):
                 return False
             index_name = tempfile.NamedTemporaryFile( prefix="bam_index" ).name
             stderr_name = tempfile.NamedTemporaryFile( prefix="bam_index_stderr" ).name
-            proc = subprocess.Popen(['samtools', 'index', file_name, index_name], stderr=open(stderr_name, 'wb'))
+            command = 'samtools index %s %s' % ( file_name, index_name )
+            proc = subprocess.Popen( args=command, shell=True, stderr=open( stderr_name, 'wb' ) )
             proc.wait()
             stderr = open( stderr_name ).read().strip()
             if stderr:
@@ -356,8 +361,8 @@ class Bam( Binary ):
         tmp_sorted_dataset_file_name_prefix = os.path.join( tmp_dir, 'sorted' )
         stderr_name = tempfile.NamedTemporaryFile( dir=tmp_dir, prefix="bam_sort_stderr" ).name
         samtools_created_sorted_file_name = "%s.bam" % tmp_sorted_dataset_file_name_prefix  # samtools accepts a prefix, not a filename, it always adds .bam to the prefix
-        proc = subprocess.Popen(['samtools', 'sort', file_name, tmp_sorted_dataset_file_name_prefix],
-                                cwd=tmp_dir, stderr=open(stderr_name, 'wb'))
+        command = "samtools sort %s %s" % ( file_name, tmp_sorted_dataset_file_name_prefix )
+        proc = subprocess.Popen( args=command, shell=True, cwd=tmp_dir, stderr=open( stderr_name, 'wb' ) )
         exit_code = proc.wait()
         # Did sort succeed?
         stderr = open( stderr_name ).read().strip()
@@ -1348,53 +1353,110 @@ class OxliGraphLabels(OxliBinary):
 Binary.register_sniffable_binary_format("oxli.graphlabels", "oxligl",
                                         OxliGraphLabels)
 
-class Fast5Archive ( CompressedArchive ):
-    """Class describing a FAST5 archive """
-    MetadataElement( name="fast5_count", default='0', param=MetadataParameter, desc="Read Count",
-                     readonly=True, visible=True, no_value=None )
-    file_ext = "fast5_archive"
 
-    def set_meta( self, dataset, overwrite=True, **kwd ):
-        super( Fast5Archive, self ).set_meta( dataset, overwrite=overwrite, **kwd )
-        try:
-            if dataset and tarfile.is_tarfile( dataset.file_name ):
-                temptar = tarfile.open( dataset.file_name, 'r' )
-                contents = temptar.getnames()
-                r = re.compile(".+\.fast5$")
-                fast5 = filter( r.match, contents )
-                dataset.metadata.fast5_count = len(fast5)
-                temptar.close()
-        except Exception as e:
-            log.warning( '%s, set_meta Exception: %s', self, e )
+class Fast5Archive(CompressedArchive):
+    """
+    Class describing a FAST5 archive
 
-    def sniff( self, filename ):
+    >>> from galaxy.datatypes.sniff import get_test_fname
+    >>> fname = get_test_fname( 'test.fast5.tar' )
+    >>> Fast5Archive().sniff( fname )
+    True
+    """
+    MetadataElement(name="fast5_count", default='0', param=MetadataParameter, desc="Read Count",
+                    readonly=True, visible=True, no_value=None)
+    file_ext = "fast5.tar"
+
+    def set_meta(self, dataset, overwrite=True, **kwd):
+        super(Fast5Archive, self).set_meta(dataset, overwrite=overwrite, **kwd)
         try:
-            if filename and tarfile.is_tarfile( filename ):
-                temptar = tarfile.open( filename, 'r' )
-                contents = temptar.getnames()
-                r = re.compile(".+\.fast5$")
-                is_fast5 = filter( r.match, contents )
-                temptar.close()
-                return is_fast5
+            if dataset and tarfile.is_tarfile(dataset.file_name):
+                with tarfile.open(dataset.file_name, 'r') as temptar:
+                    dataset.metadata.fast5_count = sum(
+                        1 for f in temptar if f.name.endswith('.fast5')
+                    )
         except Exception as e:
-            log.warning( '%s, sniff Exception: %s', self, e )
+            log.warning('%s, set_meta Exception: %s', self, e)
+
+    def sniff(self, filename):
+        try:
+            if filename and tarfile.is_tarfile(filename):
+                with tarfile.open(filename, 'r') as temptar:
+                    for f in temptar:
+                        if not f.isfile():
+                            continue
+                        if f.name.endswith('.fast5'):
+                            return True
+                        else:
+                            return False
+        except Exception as e:
+            log.warning('%s, sniff Exception: %s', self, e)
         return False
 
-    def set_peek( self, dataset, is_multi_byte=False ):
+    def set_peek(self, dataset, is_multi_byte=False):
         if not dataset.dataset.purged:
-            dataset.peek = "FAST5 Archive (%s)" % ( nice_size( dataset.get_size() ) )
-            dataset.blurb = "%s sequences" % ( dataset.metadata.fast5_count or 'unknown' )
+            dataset.peek = "FAST5 Archive (%s)" % (nice_size(dataset.get_size()))
+            dataset.blurb = "%s sequences" % (dataset.metadata.fast5_count or 'unknown')
         else:
             dataset.peek = 'file does not exist'
             dataset.blurb = 'file purged from disk'
 
-    def display_peek( self, dataset ):
+    def display_peek(self, dataset):
         try:
             return dataset.peek
         except:
-            return "FAST5 Archive (%s)" % ( nice_size( dataset.get_size() ) )
+            return "FAST5 Archive (%s)" % (nice_size(dataset.get_size()))
 
-Binary.register_sniffable_binary_format("fast5_archive", "fast5_archive", Fast5Archive)
+
+class Fast5ArchiveGz(Fast5Archive):
+    """
+    Class describing a gzip-compressed FAST5 archive
+
+    >>> from galaxy.datatypes.sniff import get_test_fname
+    >>> fname = get_test_fname( 'test.fast5.tar.gz' )
+    >>> Fast5ArchiveGz().sniff( fname )
+    True
+    >>> fname = get_test_fname( 'test.fast5.tar.bz2' )
+    >>> Fast5ArchiveGz().sniff( fname )
+    False
+    >>> fname = get_test_fname( 'test.fast5.tar' )
+    >>> Fast5ArchiveGz().sniff( fname )
+    False
+    """
+    file_ext = "fast5.tar.gz"
+
+    def sniff(self, filename):
+        if not is_gzip(filename):
+            return False
+        return Fast5Archive.sniff(self, filename)
+
+
+class Fast5ArchiveBz2(Fast5Archive):
+    """
+    Class describing a bzip2-compressed FAST5 archive
+
+    >>> from galaxy.datatypes.sniff import get_test_fname
+    >>> fname = get_test_fname( 'test.fast5.tar.bz2' )
+    >>> Fast5ArchiveBz2().sniff( fname )
+    True
+    >>> fname = get_test_fname( 'test.fast5.tar.gz' )
+    >>> Fast5ArchiveBz2().sniff( fname )
+    False
+    >>> fname = get_test_fname( 'test.fast5.tar' )
+    >>> Fast5ArchiveBz2().sniff( fname )
+    False
+    """
+    file_ext = "fast5.tar.bz2"
+
+    def sniff(self, filename):
+        if not is_bz2(filename):
+            return False
+        return Fast5Archive.sniff(self, filename)
+
+
+Binary.register_sniffable_binary_format("fast5_archive_bz2", "fast5.tar.bz2", Fast5ArchiveBz2)
+Binary.register_sniffable_binary_format("fast5_archive_gz", "fast5.tar.gz", Fast5ArchiveGz)
+Binary.register_sniffable_binary_format("fast5_archive", "fast5.tar", Fast5Archive)
 
 
 class SearchGuiArchive ( CompressedArchive ):
